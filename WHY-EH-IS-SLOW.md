@@ -9,7 +9,50 @@ throw/catch loop — a 2-3 frame unwind per throw).
 | x86_64-linux-gnu | LLVM libunwind | ~12.8 s | ~25x slower |
 | aarch64-apple-darwin24 | Apple libunwind (system) | ~97 s | ~100x slower |
 
-The native equivalent on the same machines runs in well under a second.
+The native equivalent on the same machines runs in well under a second —
+but "native speed" is itself still slow, see below.
+
+## Native C++ EH: faster than JIT, still unacceptably slow (slower than a syscall, hundreds of times slower than herbceptions)
+
+Even with the image lookup hitting the fast path, a native `throw` still pays
+for: the exception object allocation, the **two-phase** stack walk, DWARF CFI
+interpretation per frame, LSDA parsing, and personality dispatch — all to
+transfer control a few frames up. That is microsecond-scale per throw versus
+the nanosecond-scale cost of a normal return.
+
+A stark reference point is `syscall.cc` — 1,000,000 `close(-1)` calls, i.e.
+a full kernel round-trip per iteration, on x86_64-linux-gnu:
+
+| test | mechanism | time (1M iters) |
+|---|---|---|
+| `syscall` | kernel round-trip (`close(-1)`) | **~0.13 s** (~130 ns) |
+| `ehslow` | native C++ `throw`/`catch` | ~1-2.5 s (~1-2.5 µs) |
+
+Native C++ EH is roughly **an order of magnitude slower than a syscall** —
+a language-level error return costs more than crossing into the kernel and
+back. (Exact ratio depends on build: ~7x and ~19x both measured across
+toolchain configs.)
+
+Herbceptions (`throw throws` / `catch throws`, documented in
+`llvm_herbceptions/llvm-project/clang/docs/CIR/Herbceptions.md`) avoid the
+unwinder entirely: the error travels **in the return value** as `{T, i1}`.
+A throw is a store + return; a catch is a `test i1` + branch. No stack walk,
+no FDEs, no personality routine — nothing for the OS unwinder to do at all.
+
+Same 1,000,000-throw benchmark, wasm builds on the Mac:
+
+| test | mechanism | time |
+|---|---|---|
+| `flat_herbgood` | herbceptions (`{T,i1}` return + branch) | **~0.004 s** (~4 ns/throw) |
+| `flat_ehslow` | C++ EH (`_Unwind_RaiseException` × 2 phases) | ~97 s (~97 µs/throw) |
+
+~26,000x — and the gap is structural, not a tuning problem. A wasm
+herbception throw (~4 ns) is even cheaper than a native syscall (~130 ns);
+a wasm C++ throw (~97 µs) is ~750x *slower* than one. Fixing every issue in
+this document only brings wasm EH back to *native C++ EH* speed — which is
+still slower than a syscall and orders of magnitude behind value-propagated
+errors. This is the core argument for herbceptions: not "exceptions but a bit
+faster" but "error propagation that costs what it should".
 
 ## How a wasm `throw` works in WAVM
 
@@ -96,9 +139,52 @@ touches the scan-all-objects path.
   a proper indexed structure consulted directly by the kernel unwinder — no
   image scan — which is why the same tests are not slow on windows-gnu.
 
+## Implementing C++ EH for wasm is extremely hard
+
+Getting `throw`/`catch` working at all on JIT'd wasm required all of the
+following in WAVM — most of it invisible, per-platform, and fragile:
+
+- **Semantics**: the wasm exception-handling proposal gives `try`/`catch`/
+  `throw`/`rethrow` with *tags*. C++ needs LSDA type matching, cleanup landing
+  pads, `catch(...)`, rethrowing the in-flight exception, destructor ordering,
+  and `noexcept` → `std::terminate`. WAVM layers a personality routine +
+  tag/type-dispatch scheme on top to reconstruct all of it.
+- **Structured control flow**: wasm has no arbitrary jumps, so "unwind to a
+  landing pad N frames up" can't be expressed in wasm itself — the engine
+  emits IR-level `catchswitch`/`cleanuppad`/`invoke` and lowers real unwinding
+  into machine code around every call.
+- **Per-format unwind metadata**: DWARF FDEs on ELF/Mach-O, `.pdata`/`.xdata`
+  on Windows — emitted by the JIT, relocated correctly (LLVM's RuntimeDyld
+  `processFDE` actively *corrupts* arm64 Mach-O FDEs by double-applying
+  `SUBTRACTOR`-pair deltas — WAVM must repair them before registration), and
+  registered with the OS unwinder.
+- **Per-OS registration**: `__register_frame` on ELF; `RtlAddFunctionTable` +
+  SEH landing-pad trampolines on Windows; on macOS, `__register_frame` *plus*
+  the `__unw_add_find_dynamic_unwind_sections` SPI returning a valid
+  `dso_base` — without it, macOS 15's `unw_set_reg` null-dereferences
+  `unw_proc_info_t.extra` while checking `cpusubtype` for arm64e.
+- **Unwinder identity**: on macOS, dyld binds unwind symbols to whichever
+  libunwind is loaded; LLVM and Apple libunwind have different `UnwindCursor`
+  layouts, so a single unwind crossing both segfaults.
+- **Traps are not EH**: div-by-zero/OOB/stack-overflow arrive as signals (or
+  SEH exceptions) and need a separate translation layer (`catchSignals`) that
+  must coexist with the unwind machinery.
+
+And all of it must hold simultaneously across architectures
+(x86_64/arm64/arm64e), object formats (ELF/Mach-O/PE), and unwinders
+(LLVM/Apple/Windows) — which is why porting this subsystem means debugging
+segfaults inside the unwinder itself. By contrast, the entire herbception
+lowering is "return `{T, i1}` and branch on the discriminant" — no ABI
+contract with the OS unwinder exists at all.
+
 ## TL;DR
 
 Slow wasm EH is not a WAVM codegen problem. It is the Itanium unwinder's
 PC→unwind-info lookup: JIT code isn't a loaded image, so every single frame
 lookup on every single unwind pays a linear scan of all loaded objects before
 reaching the registered-FDE list — and no public API lets a JIT change that.
+
+And even if it could, table-driven unwinding is still ~µs per throw — slower
+than a kernel syscall round-trip — while herbceptions propagate errors in the
+return value at ~ns per throw. C++ EH is hard to implement on wasm, slow even
+when implemented perfectly, and slower still under a JIT.
