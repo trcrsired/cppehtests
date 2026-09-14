@@ -12,7 +12,7 @@ throw/catch loop — a 2-3 frame unwind per throw).
 The native equivalent on the same machines runs in well under a second —
 but "native speed" is itself still slow, see below.
 
-## Native C++ EH: faster than JIT, still unacceptably slow (slower than a syscall, hundreds of times slower than herbceptions)
+## Native C++ EH: faster than JIT, still unacceptably slow (~100x slower than a syscall; compared to herbceptions, nearly infinitely slower)
 
 Even with the image lookup hitting the fast path, a native `throw` still pays
 for: the exception object allocation, the **two-phase** stack walk, DWARF CFI
@@ -27,11 +27,12 @@ a full kernel round-trip per iteration, on x86_64-linux-gnu:
 |---|---|---|
 | `syscall` | kernel round-trip (`close(-1)`) | **~0.13 s** (~130 ns) |
 | `ehslow` | native C++ `throw`/`catch` | ~1-2.5 s (~1-2.5 µs) |
+| `ehslow` (wasm, macOS) | C++ `throw`/`catch` under WAVM | ~97 s (~97 µs) |
 
-Native C++ EH is roughly **an order of magnitude slower than a syscall** —
-a language-level error return costs more than crossing into the kernel and
-back. (Exact ratio depends on build: ~7x and ~19x both measured across
-toolchain configs.)
+A language-level error return costs **more than crossing into the kernel and
+back** — ~7-19x slower than a syscall natively, and ~750x slower under a JIT
+(~100x or worse in realistic workloads). Throwing a C++ exception is more
+expensive than asking the kernel to do work for you.
 
 Herbceptions (`throw throws` / `catch throws`, documented in
 `llvm_herbceptions/llvm-project/clang/docs/CIR/Herbceptions.md`) avoid the
@@ -46,13 +47,17 @@ Same 1,000,000-throw benchmark, wasm builds on the Mac:
 | `flat_herbgood` | herbceptions (`{T,i1}` return + branch) | **~0.004 s** (~4 ns/throw) |
 | `flat_ehslow` | C++ EH (`_Unwind_RaiseException` × 2 phases) | ~97 s (~97 µs/throw) |
 
-~26,000x — and the gap is structural, not a tuning problem. A wasm
-herbception throw (~4 ns) is even cheaper than a native syscall (~130 ns);
-a wasm C++ throw (~97 µs) is ~750x *slower* than one. Fixing every issue in
-this document only brings wasm EH back to *native C++ EH* speed — which is
-still slower than a syscall and orders of magnitude behind value-propagated
-errors. This is the core argument for herbceptions: not "exceptions but a bit
-faster" but "error propagation that costs what it should".
+~26,000x — and the gap is structural, not a tuning problem. Compared to
+herbceptions, C++ EH is **nearly infinitely slower**: a herbception throw is
+just a return with the discriminant set, so on the happy path its overhead
+over a plain call is *zero* — there is no floor the ratio can settle at.
+A wasm herbception throw (~4 ns) is even cheaper than a native syscall
+(~130 ns); a wasm C++ throw (~97 µs) is ~750x *slower* than one. Fixing every
+issue in this document only brings wasm EH back to *native C++ EH* speed —
+which is still slower than a syscall and arbitrarily far behind
+value-propagated errors. This is the core argument for herbceptions: not
+"exceptions but a bit faster" but "error propagation that costs what it
+should".
 
 ## How a wasm `throw` works in WAVM
 
