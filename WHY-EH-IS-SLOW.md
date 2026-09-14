@@ -32,7 +32,12 @@ a full kernel round-trip per iteration, on x86_64-linux-gnu:
 
 A language-level error return costs **more than crossing into the kernel and
 back** — ~7-19x slower than a syscall natively, and ~750x slower under a JIT
-(~100x or worse in realistic workloads). Meanwhile the same 1M herbception
+(~100x or worse in realistic workloads). **~100x slower than a syscall is
+totally unacceptable**: a syscall is already considered an expensive,
+to-be-avoided operation — code goes out of its way to batch I/O and use
+`vDSO`/io_uring precisely to dodge that ~130ns. If reporting one error to the
+caller costs more than an entire trip into the kernel and back, the
+mechanism has failed at its only job. Meanwhile the same 1M herbception
 throws take 351 ns *total* — ~7,000,000x faster than native C++ EH and
 ~370,000x faster than a single syscall, because the whole thing is just a
 discriminant in a register. Throwing a C++ exception is more expensive than
