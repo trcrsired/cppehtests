@@ -153,6 +153,33 @@ touches the scan-all-objects path.
   a proper indexed structure consulted directly by the kernel unwinder — no
   image scan — which is why the same tests are not slow on windows-gnu.
 
+## Corollary: EH cost scales with the number of loaded shared libraries
+
+The same mechanism means a *native* program's EH speed depends on how many
+dylibs it links:
+
+- **glibc/Linux**: native PCs are covered by `_dl_find_object`, an indexed
+  address-range database the loader maintains (plus `eh_frame_hdr` binary
+  search inside the found object), so DSO count mostly doesn't hurt native
+  lookups. The O(#objects) `dl_iterate_phdr` scan is only paid by PCs outside
+  all images — JIT code. That's exactly why WAVM, whose own `wavm` binary
+  drags in 169 `libLLVM*.so` component dylibs, is hit so hard: the fallback
+  scan it runs ~7 times per throw is sized by the process's object count.
+- **macOS**: `_dyld_find_unwind_sections` → `findImageMappedAt` walks the
+  image list even for *native* PCs (early exit at the containing image), so
+  every unwind lookup is O(position in the image list). A program linking
+  170 dylibs pays ~250 image checks per lookup per frame — throw-heavy code
+  in a many-dylib program genuinely gets slower the more libraries it links.
+- **Windows**: `RtlLookupFunctionEntry` uses the kernel's indexed function
+  tables — insensitive to module count. Not a problem.
+
+This is consistent with why large, many-DSO codebases (LLVM itself bans
+exceptions) avoid EH on the hot path: its per-throw cost isn't a fixed
+constant — it's proportional to the environment the process happens to
+load. (LLVM's official reasons are binary size, portability, and
+`Error`/`Expected` determinism, but the image-count-proportional lookup cost
+makes EH an even worse fit for a 170-dylib build.)
+
 ## Implementing C++ EH for wasm is extremely hard
 
 Getting `throw`/`catch` working at all on JIT'd wasm required all of the
